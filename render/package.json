@@ -1,7 +1,7 @@
 {
-    "name": "repochat",
-    "version": "3.2.0",
-    "description": "Google Colab Orchestrator - API-Only Backend for 3 Frontend Apps",
+    "name": "ColabBridge",
+    "version": "2.1.0",
+    "description": "A REST API wrapper around Google Colab CLI that enables remote execution of Python code on Colab VMs",
     "main": "server.js",
     "scripts": {
         "start": "node server.js",
