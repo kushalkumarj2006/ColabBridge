@@ -1,8 +1,9 @@
-Here's the fixed README with all working links:
-
----
-
 # ColabBridge
+
+[![License](https://img.shields.io/github/license/kushalkumarj2006/ColabBridge)](https://github.com/kushalkumarj2006/ColabBridge/blob/main/LICENSE)
+[![Render](https://img.shields.io/badge/Render-Deployed-brightgreen)](https://colabbridge-jyba.onrender.com/health)
+[![Last Commit](https://img.shields.io/github/last-commit/kushalkumarj2006/ColabBridge)](https://github.com/kushalkumarj2006/ColabBridge/commits/main)
+[![Repo Size](https://img.shields.io/github/repo-size/kushalkumarj2006/ColabBridge)](https://github.com/kushalkumarj2006/ColabBridge)
 
 > A REST API wrapper around Google Colab CLI that enables remote execution of Python code on Colab VMs
 
