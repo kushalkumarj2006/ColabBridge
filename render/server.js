@@ -53,6 +53,7 @@ const MAX_CODE_SIZE = parseInt(process.env.MAX_CODE_SIZE) || 3 * 1024 * 1024;
 const COMPLETED_EXECUTIONS_TTL = parseInt(process.env.COMPLETED_EXECUTIONS_TTL) || 10 * 60 * 1000;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL) || 15000;
 const SESSIONS_BASE_DIR = process.env.SESSIONS_BASE_DIR || path.join(os.tmpdir(), 'colab_sessions');
+const HANGING_PROCESS_CLEANUP_INTERVAL = parseInt(process.env.HANGING_PROCESS_CLEANUP_INTERVAL) || 300000;
 
 // Colab binary configuration (matches original behavior)
 let COLAB_BINARY = 'colab';
@@ -87,41 +88,6 @@ async function findColabBinaryRecursive() {
             }
         }
     } catch(e) {}
-
-    // Try 3: Search common paths
-    const searchPaths = [
-        '/opt/render/.local/bin',
-        '/usr/local/bin', 
-        '/usr/bin',
-        '/opt/render/project/.local/bin',
-        '/home/render/.local/bin',
-        '/opt/render/project/src/.local/bin'
-    ];
-    
-    for (const searchPath of searchPaths) {
-        try {
-            const result = execSync(`find ${searchPath} -name "colab" -type f 2>/dev/null | head -1`, { encoding: 'utf8', timeout: 10000 }).trim();
-            if (result && result !== '') {
-                console.log(`✅ Found colab via recursive search: ${result}`);
-                try {
-                    execSync(`chmod +x "${result}"`, { stdio: 'ignore' });
-                } catch(e) {}
-                return result;
-            }
-        } catch(e) {}
-    }
-
-    // Try 4: Check existing binary
-    const existingBinary = path.join(__dirname, 'colab');
-    if (require('fs').existsSync(existingBinary)) {
-        try {
-            const content = require('fs').readFileSync(existingBinary, 'utf8').slice(0, 200);
-            if (content.includes('python') || content.includes('#!/')) {
-                console.log(`✅ Existing binary is a Python script, using python3 -m colab_cli`);
-                return 'python3';
-            }
-        } catch(e) {}
-    }
 
     console.warn('⚠️ colab binary not found, will use python3 -m colab_cli');
     return 'python3';
@@ -268,7 +234,16 @@ async function appendSessionData(sessionId, data) {
             };
         }
         
-        sessionData.cells.push(data);
+        // ✅ FIX: Check if cell already exists, replace it instead of appending
+        const existingIndex = sessionData.cells.findIndex(c => c.cellNo === data.cellNo && c.type === data.type);
+        if (existingIndex !== -1) {
+            // Replace existing cell data
+            sessionData.cells[existingIndex] = data;
+        } else {
+            // New cell - append
+            sessionData.cells.push(data);
+        }
+        
         sessionData.totalCells = sessionData.cells.length;
         sessionData.totalExecutions = sessionData.cells.filter(c => c.type === 'execution').length;
         sessionData.lastUpdated = new Date().toISOString();
@@ -362,7 +337,7 @@ setInterval(() => {
             executionProcesses.delete(execId);
         }
     }
-}, 5 * 60 * 1000);
+}, HANGING_PROCESS_CLEANUP_INTERVAL);
 
 // ============================================
 // CODE EXECUTION
@@ -582,7 +557,7 @@ app.get('/help', (req, res) => {
                 "GET /sessions",
                 "GET /sessions/:identifier"
             ],
-            note: "The default API secret is 'your-api-key'. It is recommended to change this in production."
+            note: "The API secret is configured via the API_SECRET environment variable."
         },
         endpoints: {
             health: {
@@ -609,35 +584,6 @@ app.get('/help', (req, res) => {
                         colabBinary: "Path to Colab CLI binary being used",
                         usePythonModule: "Whether Python module is being used instead of binary",
                         hasAuthToken: "Whether COLAB_AUTH_TOKEN is configured"
-                    },
-                    example: {
-                        status: "healthy",
-                        activeSessions: 1,
-                        maxSessions: 3,
-                        sessionDetails: [
-                            {
-                                id: "a1b2c3d4e5f6...",
-                                colabSession: "colab_a1b2c3d4e5f6",
-                                createdAt: "2026-06-17T00:00:00.000Z",
-                                lastActivity: "2026-06-17T00:05:00.000Z",
-                                status: "ready",
-                                hasCurrentExecution: false
-                            }
-                        ],
-                        completedExecutions: 5,
-                        queuedExecutions: 0,
-                        uptime: 3600,
-                        memoryUsage: {
-                            rss: "56.78 MB",
-                            heapTotal: "34.56 MB",
-                            heapUsed: "23.45 MB",
-                            external: "5.67 MB",
-                            arrayBuffers: "1.23 MB"
-                        },
-                        timestamp: "2026-06-17T00:00:00.000Z",
-                        colabBinary: "/usr/bin/colab",
-                        usePythonModule: false,
-                        hasAuthToken: true
                     }
                 },
                 usage: {
@@ -661,11 +607,6 @@ app.get('/help', (req, res) => {
                         status: "Always 'up' if server is running",
                         timestamp: "Current server time in ISO format",
                         sessions: "Number of active sessions"
-                    },
-                    example: {
-                        status: "up",
-                        timestamp: "2026-06-17T00:00:00.000Z",
-                        sessions: 1
                     }
                 },
                 usage: {
@@ -685,8 +626,7 @@ app.get('/help', (req, res) => {
                 },
                 response: {
                     format: "JSON",
-                    description: "This entire documentation structure",
-                    fields: "See this response for complete structure"
+                    description: "This entire documentation structure"
                 },
                 usage: {
                     curl: `curl ${baseUrl}/help`,
@@ -710,7 +650,7 @@ app.get('/help', (req, res) => {
                         maxSessions: "Maximum sessions allowed",
                         sessions: "Array of session objects",
                         sessions_sub: "Short identifier (first 8 chars of sessionId)",
-                        sessions_sessionId: "Full 32-character hex session ID",
+                        sessions_sessionId: "Full 64-character hex session ID",
                         sessions_colabSession: "Internal Colab session name",
                         sessions_status: "Session status: 'ready', 'busy', or 'auth_required'",
                         sessions_createdAt: "Session creation timestamp",
@@ -728,33 +668,6 @@ app.get('/help', (req, res) => {
                         completedExecutions: "Number of completed executions in memory",
                         uptime: "Server uptime in seconds",
                         timestamp: "Current server time"
-                    },
-                    example: {
-                        totalSessions: 1,
-                        maxSessions: 3,
-                        sessions: [
-                            {
-                                sub: "a1b2c3d4",
-                                sessionId: "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
-                                colabSession: "colab_a1b2c3d4e5f6",
-                                status: "ready",
-                                createdAt: "2026-06-17T00:00:00.000Z",
-                                lastActivity: "2026-06-17T00:05:00.000Z",
-                                activeMinutes: 5.00,
-                                cellsExecuted: 3,
-                                executions: 3,
-                                hasCurrentExecution: false,
-                                folder: "/tmp/colab_sessions/a1b2c3d4...",
-                                dataFileExists: true
-                            }
-                        ],
-                        memoryUsage: { rss: "56.78 MB", heapTotal: "34.56 MB", heapUsed: "23.45 MB" },
-                        totalCellsExecuted: 3,
-                        totalExecutions: 3,
-                        queuedExecutions: 0,
-                        completedExecutions: 5,
-                        uptime: 3600,
-                        timestamp: "2026-06-17T00:00:00.000Z"
                     }
                 },
                 usage: {
@@ -771,78 +684,41 @@ app.get('/help', (req, res) => {
                 request: {
                     format: "URL parameter",
                     parameters: {
-                        identifier: "Session ID (full 32-char hex) OR sub (first 8 chars). E.g., /sessions/a1b2c3d4 or /sessions/a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+                        identifier: "Session ID (full 64-char hex) OR sub (first 8 chars). E.g., /sessions/a1b2c3d4 or /sessions/a1b2c3d4e5f6..."
                     },
-                    headers: "None required",
-                    example: `${baseUrl}/sessions/a1b2c3d4`
+                    headers: "None required"
                 },
                 response: {
                     format: "JSON",
                     fields: {
                         session: "Session metadata object",
                         session_sub: "Short identifier (first 8 chars)",
-                        session_sessionId: "Full session ID",
+                        session_sessionId: "Full 64-character hex session ID",
                         session_colabSession: "Colab session name",
-                        session_status: "Current status",
+                        session_status: "Current status ('ready', 'busy', 'auth_required')",
                         session_createdAt: "Creation timestamp",
                         session_lastActivity: "Last activity timestamp",
                         session_activeMinutes: "Session age in minutes",
                         session_hasCurrentExecution: "Whether execution is running",
                         session_folder: "Session folder path",
-                        sessionData: "Detailed execution history",
-                        sessionData_cells: "Array of executed cells with code and outputs",
+                        sessionData: "Detailed execution history with all cells",
+                        sessionData_cells: "Array of executed cells with code, outputs, and status",
                         sessionData_totalCells: "Total cells count",
                         sessionData_totalExecutions: "Total executions count",
                         sessionData_lastUpdated: "Last update timestamp",
                         currentExecution: "Currently running execution info (or null)",
                         currentExecution_executionId: "Execution ID",
                         currentExecution_cellNo: "Cell number being executed",
-                        currentExecution_startedAt: "Start timestamp",
-                        currentExecution_status: "Execution status",
-                        currentExecution_partialOutput: "Partial output so far",
-                        currentExecution_partialError: "Partial error output so far",
+                        currentExecution_startedAt: "Start timestamp (milliseconds)",
+                        currentExecution_status: "Execution status ('running')",
+                        currentExecution_partialOutput: "Partial stdout output so far",
+                        currentExecution_partialError: "Partial stderr output so far",
                         memoryUsage: "Memory usage breakdown",
                         timestamp: "Current server time"
                     },
                     error: {
                         status: 404,
                         body: { error: "Session not found", message: "No session found with identifier: ..." }
-                    },
-                    example: {
-                        session: {
-                            sub: "a1b2c3d4",
-                            sessionId: "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
-                            colabSession: "colab_a1b2c3d4e5f6",
-                            status: "ready",
-                            createdAt: "2026-06-17T00:00:00.000Z",
-                            lastActivity: "2026-06-17T00:05:00.000Z",
-                            activeMinutes: "5.00",
-                            hasCurrentExecution: false,
-                            folder: "/tmp/colab_sessions/a1b2c3d4..."
-                        },
-                        sessionData: {
-                            sessionId: "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
-                            createdAt: "2026-06-17T00:00:00.000Z",
-                            cells: [
-                                {
-                                    type: "execution",
-                                    cellNo: 1,
-                                    startedAt: "2026-06-17T00:01:00.000Z",
-                                    code: "print('Hello World')",
-                                    status: "completed",
-                                    completedAt: "2026-06-17T00:01:02.000Z",
-                                    executionTime: 2000,
-                                    output: "Hello World\n",
-                                    error: ""
-                                }
-                            ],
-                            totalCells: 1,
-                            totalExecutions: 1,
-                            lastUpdated: "2026-06-17T00:05:00.000Z"
-                        },
-                        currentExecution: null,
-                        memoryUsage: { rss: "56.78 MB", heapTotal: "34.56 MB", heapUsed: "23.45 MB" },
-                        timestamp: "2026-06-17T00:00:00.000Z"
                     }
                 },
                 usage: {
@@ -873,7 +749,7 @@ app.get('/help', (req, res) => {
                     format: "JSON",
                     success: {
                         success: true,
-                        sessionId: "32-character hex session ID",
+                        sessionId: "64-character hex session ID",
                         authUrl: "null (if no auth needed)",
                         expiresIn: "Session timeout in milliseconds",
                         activeSessions: "Current session count",
@@ -884,21 +760,12 @@ app.get('/help', (req, res) => {
                         success: false,
                         needsAuth: true,
                         authUrl: "Google OAuth URL to authenticate",
-                        sessionId: "32-character hex session ID",
+                        sessionId: "64-character hex session ID",
                         message: "Please authenticate with Google"
                     },
                     error: {
                         status: 401,
                         body: { error: "Invalid API secret" }
-                    },
-                    example: {
-                        success: true,
-                        sessionId: "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
-                        authUrl: null,
-                        expiresIn: 10800000,
-                        activeSessions: 1,
-                        maxSessions: 3,
-                        message: "Session created successfully"
                     }
                 },
                 usage: {
@@ -923,7 +790,7 @@ app.get('/help', (req, res) => {
                     },
                     example: {
                         api_secret: "your-api-key",
-                        sessionId: "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+                        sessionId: "a1b2c3d4e5f6..."
                     }
                 },
                 response: {
@@ -939,14 +806,10 @@ app.get('/help', (req, res) => {
                     notFound: {
                         status: 404,
                         body: { error: "Session not found" }
-                    },
-                    example: {
-                        success: true,
-                        message: "Session kept alive"
                     }
                 },
                 usage: {
-                    curl: `curl -X POST ${baseUrl}/keepalive -H "Content-Type: application/json" -d '{"api_secret":"your-api-key","sessionId":"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"}'`,
+                    curl: `curl -X POST ${baseUrl}/keepalive -H "Content-Type: application/json" -d '{"api_secret":"your-api-key","sessionId":"a1b2c3d4..."}'`,
                     javascript: `fetch('${baseUrl}/keepalive', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_secret: 'your-api-key', sessionId: 'a1b2c3d4...' }) }).then(r => r.json()).then(console.log);`
                 },
                 recommendedInterval: "Call every 30-60 minutes to prevent session expiration"
@@ -973,7 +836,7 @@ app.get('/help', (req, res) => {
                     },
                     example: {
                         api_secret: "your-api-key",
-                        sessionId: "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+                        sessionId: "a1b2c3d4e5f6...",
                         code: "print('Hello World')",
                         cellNo: 1
                     }
@@ -1008,13 +871,6 @@ app.get('/help', (req, res) => {
                     notFound: {
                         status: 404,
                         body: { error: "Session not found" }
-                    },
-                    example: {
-                        status: "processing",
-                        sessionId: "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
-                        executionId: "f1e2d3c4b5a6",
-                        pollInterval: 15000,
-                        message: "Code execution started. Poll /status for results."
                     }
                 },
                 usage: {
@@ -1039,7 +895,7 @@ app.get('/help', (req, res) => {
                     },
                     example: {
                         api_secret: "your-api-key",
-                        sessionId: "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+                        sessionId: "a1b2c3d4e5f6...",
                         executionId: "f1e2d3c4b5a6"
                     }
                 },
@@ -1066,12 +922,6 @@ app.get('/help', (req, res) => {
                     notFound: {
                         status: "not_found",
                         message: "Execution not found or already completed"
-                    },
-                    example: {
-                        status: "completed",
-                        output: "Hello World\n",
-                        error: "",
-                        executionTime: 1234
                     }
                 },
                 usage: {
@@ -1111,10 +961,6 @@ app.get('/help', (req, res) => {
                     notFound: {
                         success: false,
                         message: "Execution not found"
-                    },
-                    example: {
-                        success: true,
-                        message: "Acknowledged"
                     }
                 },
                 usage: {
@@ -1136,7 +982,7 @@ app.get('/help', (req, res) => {
                     parameters: {
                         sessionId: "Session ID to delete (in URL path)"
                     },
-                    example: `DELETE ${baseUrl}/session/a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6`
+                    example: `DELETE ${baseUrl}/session/a1b2c3d4e5f6...`
                 },
                 response: {
                     format: "JSON",
@@ -1155,15 +1001,11 @@ app.get('/help', (req, res) => {
                     notFound: {
                         status: 404,
                         body: { error: "Session not found" }
-                    },
-                    example: {
-                        success: true,
-                        message: "Session terminated"
                     }
                 },
                 usage: {
-                    curl: `curl -X DELETE ${baseUrl}/session/a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6 -H "api-secret: your-api-key"`,
-                    javascript: `fetch('${baseUrl}/session/a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6', { method: 'DELETE', headers: { 'api-secret': 'your-api-key' } }).then(r => r.json()).then(console.log);`
+                    curl: `curl -X DELETE ${baseUrl}/session/a1b2c3d4e5f6... -H "api-secret: your-api-key"`,
+                    javascript: `fetch('${baseUrl}/session/a1b2c3d4e5f6...', { method: 'DELETE', headers: { 'api-secret': 'your-api-key' } }).then(r => r.json()).then(console.log);`
                 }
             }
         },
@@ -1259,7 +1101,7 @@ app.get('/help', (req, res) => {
                 {
                     code: 400,
                     description: "Missing required fields",
-                    solution: "Check that all required fields are included in the request body"
+                    solution: "Check that all required fields (sessionId, code, cellNo) are included in the request body"
                 },
                 {
                     code: 500,
@@ -1278,11 +1120,14 @@ app.get('/help', (req, res) => {
         environmentVariables: {
             API_SECRET: "Your API secret for authentication",
             COLAB_AUTH_TOKEN: "Google Colab authentication token (JSON format)",
-            MAX_SESSIONS: "Maximum concurrent sessions (default: 3)",
-            SESSION_TIMEOUT: "Session timeout in milliseconds (default: 3 hours)",
-            EXECUTION_TIMEOUT: "Execution timeout in seconds (default: 2 hours)",
-            PORT: "Server port (default: 3000)",
-            SESSIONS_BASE_DIR: "Session storage directory (default: /tmp/colab_sessions)"
+            MAX_SESSIONS: "Maximum concurrent sessions",
+            SESSION_TIMEOUT: "Session timeout in milliseconds",
+            EXECUTION_TIMEOUT: "Execution timeout in seconds",
+            PORT: "Server port",
+            SESSIONS_BASE_DIR: "Session storage directory",
+            COMPLETED_EXECUTIONS_TTL: "Time to keep completed executions in memory (milliseconds)",
+            POLL_INTERVAL: "Recommended polling interval in milliseconds",
+            HANGING_PROCESS_CLEANUP_INTERVAL: "Interval to check for hanging processes (milliseconds)"
         },
         timestamp: new Date().toISOString()
     });
@@ -1295,8 +1140,6 @@ app.get('/help', (req, res) => {
 app.get('/health', (req, res) => {
     const memUsage = process.memoryUsage();
     const now = new Date().toISOString();
-    console.log(`💚 Health check at ${now}, ${sessions.size} active sessions`);
-    
     res.json({
         status: 'healthy',
         activeSessions: sessions.size,
